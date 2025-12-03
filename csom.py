@@ -1,112 +1,219 @@
 from __future__ import annotations
 
-from typing import Any, List, Tuple, cast
+from typing import Any, NamedTuple, cast
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from numpy.typing import NDArray
-from pydantic import BaseModel
 
 
-class CSOMConfig(BaseModel):
-    map_size: int
-    num_iterations: int
-    alpha: int
-    beta: int
-    window_size: int
+class Config(NamedTuple):
+    """CSOMの設定パラメータ"""
+
+    # 観測データのファイルパス
+    raw_file: str = "data/mine.csv"
+
+    # 測定パラメータ
+    start_freq: float = 8.0  # GHz
+    stop_freq: float = 12.0
+    freq_point: int = 1601
+    scale_x: int = 30
+    scale_y: int = 30
+
+    # SOM 学習パラメータ
+    alpha: float = 0.4  # 学習率 (勝者)
+    beta: float = 0.01  # 学習率 (近傍)
+    epochs: int = 100  # 学習ループ回数
+    num_classes: int = 8  # クラス数 (参照ベクトル数)
+
+    # 特徴量抽出パラメータ
+    freq_count: int = 100  # サンプリングする周波数の数
+    window_size: int = 5  # 特徴抽出の窓サイズ (L)
 
 
-class ImagingData(BaseModel):
-    raw_data: Any
-    freq_count: int
-    height: int
-    width: int
-
-    @classmethod
-    def from_array(cls, array: np.ndarray) -> ImagingData:
-        freq_count, height, width = array.shape
-        return cls(
-            raw_data=array,
-            freq_count=freq_count,
-            height=height,
-            width=width,
-        )
-
-
-class FeatureData(BaseModel):
-    vectors: np.ndarray  # (N_samples, input_dim)
-    positions: List[Tuple[int, int]]
-    original_shape: Tuple[int, int]
-
-
-def normalize_data(raw_data: NDArray[np.complex128]) -> NDArray[np.complex128]:
+def load_file(
+    cfg: Config,
+) -> NDArray[np.complex128]:
     """
-    複素振幅データの対数変換と正規化を行う関数
+    ファイルから複素振幅データを読み込む関数
     """
-    amp = np.abs(raw_data)
-    phase = np.angle(raw_data)
+    df = pd.read_csv(cfg.raw_file, header=None)
+    df.columns = ["index_freq", "freq", "amp", "phase", "x", "y"]
 
-    amp_db = 20 * np.log10(amp)
+    # 正規化と複素数変換
+    min_amp = df["amp"].min()
+    max_amp = df["amp"].max()
+    df["amp_norm"] = (df["amp"] - min_amp) / (max_amp - min_amp)
+    complex_values = df["amp_norm"] * np.exp(1j * np.deg2rad(df["phase"]))
 
-    min_val = np.min(amp_db)
-    max_val = np.max(amp_db)
+    # 往復走査の補正
+    max_y = df["y"].max()
+    real_y = np.where(df["x"] % 2 != 0, max_y - df["y"], df["y"])
 
-    amp_norm = (amp_db - min_val) / (max_val - min_val)
+    data = np.zeros((cfg.scale_x, cfg.scale_y, cfg.freq_point), dtype=np.complex128)
+    data[df["x"], real_y, df["index_freq"]] = complex_values
 
-    result = amp_norm * np.exp(1j * phase)
-
-    return cast(NDArray[np.complex128], result)
+    return data
 
 
-def calculate_local_features(window: np.ndarray, n_freq: int) -> np.ndarray:
+def extract_features(
+    data: NDArray[np.complex128], cfg: Config
+) -> NDArray[np.complex128]:
     """
-    1つのウィンドウから特徴ベクトル(1D)を計算する純粋関数
+    複素振幅データから特徴量を抽出する関数
     """
-    L = window.shape[0]  # window_size
+    L = cfg.window_size
+    rows, cols, _ = data.shape
+    out_rows = rows - (L - 1)
+    out_cols = cols - (L - 1)
 
-    M = np.mean(window)
-
-    # ラグ: (0,0), (1,0), (0,1), (1,1)
-    lags = [(0, 0), (1, 0), (0, 1), (1, 1)]
-    K_s = []
-    for di, dj in lags:
-        w_curr = window[0 : L - di, 0 : L - dj, :]
-        w_shift = window[di:L, dj:L, :]
-        # 複素共役との積の平均
-        K_s.append(np.mean(np.conj(w_curr) * w_shift))
-
-    K_f = []
-    for n in range(n_freq - 1):
-        z_n = window[:, :, n]
-        z_n1 = window[:, :, n + 1]
-        K_f.append(np.mean(np.conj(z_n) * z_n1))
-
-    return np.concatenate(([M], K_s, K_f))
-
-
-def extract_features(raw_data: np.ndarray, config: CSOMConfig) -> FeatureData:
-    """
-    画像全体から特徴ベクトルを抽出する関数
-    """
-    H, W, N_freq = raw_data.shape
-    L = config.window_size
-    offset = L // 2
-
-    norm_data = normalize_data(raw_data)
-
-    coords = [
-        (y, x) for y in range(offset, H - offset) for x in range(offset, W - offset)
-    ]
-
-    def process_coord(coord: Tuple[int, int]) -> np.ndarray:
-        y, x = coord
-        window = norm_data[y - offset : y + offset + 1, x - offset : x + offset + 1, :]
-        feature_vector = calculate_local_features(window, N_freq)
-        return feature_vector
-
-    vectors = np.array([process_coord(coord) for coord in coords])
-
-    return FeatureData(
-        vectors=vectors,
-        positions=coords,
-        original_shape=(H, W),
+    features = np.zeros(
+        (out_rows, out_cols, (cfg.freq_count - 1) + 5), dtype=np.complex128
     )
+
+    norm_const = L * L * cfg.freq_count
+
+    for x in range(out_rows):
+        for y in range(out_cols):
+            block = data[x : x + L, y : y + L, :]
+
+            # 1. 平均値
+            features[x, y, 0] = np.sum(block) / norm_const
+
+            # 2-5. 空間相関(0,0), (1,0), (0,1), (1,1)
+            features[x, y, 1] = calc_spatial_corr(data, x, y, 0, 0, cfg)
+            features[x, y, 2] = calc_spatial_corr(data, x, y, 1, 0, cfg)
+            features[x, y, 3] = calc_spatial_corr(data, x, y, 0, 1, cfg)
+            features[x, y, 4] = calc_spatial_corr(data, x, y, 1, 1, cfg)
+
+            # 6-. 周波数間相関
+            for i in range(cfg.freq_count - 1):
+                d1 = data[x : x + L, y : y + L, i]
+                d2 = data[x : x + L, y : y + L, i + 1]
+
+                features[x, y, 5 + i] = np.sum(d1 * d2.conj()) / L * L
+
+    return features
+
+
+def calc_spatial_corr(
+    data: NDArray[np.complex128],
+    x: int,
+    y: int,
+    dx: int,
+    dy: int,
+    cfg: Config,
+) -> np.complex128:
+    L = cfg.window_size
+    rows, cols, _ = data.shape
+
+    tx, ty = x + dx, y + dy
+
+    curr_x_end = min(x + L, rows - dx)
+    curr_y_end = min(y + L, cols - dy)
+
+    lx = curr_x_end - x
+    ly = curr_y_end - y
+
+    b1 = data[x : x + lx, y : y + ly, :]
+    b2 = data[tx : tx + lx, ty : ty + ly, :]
+
+    n_freq = cfg.freq_count
+    return cast(np.complex128, np.sum(b1 * b2.conj()) / (lx * ly * n_freq))
+
+
+def init_weights(dim: int, n_classes: int) -> NDArray[np.complex128]:
+    w_amp = np.random.rand(dim, n_classes)
+    w_phase = 2 * np.pi * np.random.rand(dim, n_classes)
+
+    return cast(NDArray[np.complex128], w_amp * np.exp(1j * w_phase))
+
+
+def find_winner(vec: NDArray[np.complex128], weights: NDArray[np.complex128]) -> int:
+    dots = vec.conj() @ weights
+    norms = np.linalg.norm(vec) * np.linalg.norm(weights, axis=0) + 1e-12
+    return int(np.argmax(np.abs(dots) / norms))
+
+
+def update_vecotor(
+    w: NDArray[np.complex128], k: NDArray[np.complex128], coef: float
+) -> NDArray[np.complex128]:
+    diff = np.angle(w) - np.angle(k)
+    abs_k = np.abs(k)
+
+    new_amp = (1 - coef) * np.abs(w) + coef * abs_k * np.cos(diff)
+    new_angle = np.angle(w) - coef * abs_k * np.sin(diff)
+
+    return cast(NDArray[np.complex128], new_amp * np.exp(1j * new_angle))
+
+
+def train_csom(features: NDArray[np.complex128], cfg: Config) -> Any:
+    rows, cols, dim = features.shape
+    weights = init_weights(dim, cfg.num_classes)
+
+    # 可視化用セットアップ
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.axis("off")
+    frames = []
+
+    for t in range(cfg.epochs):
+        rate = (cfg.epochs - t) / cfg.epochs
+        alpha_t = cfg.alpha * rate
+        beta_t = cfg.beta * rate
+
+        class_map = np.zeros((rows, cols), dtype=int)
+
+        for x in range(rows):
+            for y in range(cols):
+                k = features[x, y]
+
+                winner = find_winner(k, weights)
+                class_map[x, y] = winner
+
+                weights[:, winner] = update_vecotor(weights[:, winner], k, alpha_t)
+
+                left = (winner - 1) % cfg.num_classes
+                right = (winner - 1) % cfg.num_classes
+
+                weights[:, left] = update_vecotor(weights[:, left], k, beta_t)
+                weights[:, right] = update_vecotor(weights[:, right], k, beta_t)
+
+        img = ax.imshow(class_map, cmap="Greys", vmin=0, vmax=cfg.num_classes - 1)
+        frames.append([img])
+
+    return fig, frames
+
+
+def main() -> None:
+    cfg = Config()
+    data = load_file(Config())
+
+    # 10個の周波数成分を用いて特徴量抽出
+    selected_freqs = np.linspace(0, cfg.freq_point - 1, cfg.freq_count, dtype=int)
+    print(selected_freqs)
+
+    features = extract_features(
+        data[:, :, selected_freqs],
+        cfg,
+    )
+
+    fig, frames = train_csom(features, cfg)
+    # 結果保存
+    print("Saving video...")
+    ani = animation.ArtistAnimation(fig, frames, interval=100, blit=True)
+    try:
+        ani.save("CSOM_numpy.mp4", writer="ffmpeg")
+    except Exception as e:
+        print(f"Video save failed (ffmpeg required): {e}")
+        ani.save("CSOM_numpy.gif", writer="pillow")
+
+    plt.savefig("CSOM_numpy_final.png")
+
+
+if __name__ == "__main__":
+    main()
