@@ -1,0 +1,22 @@
+[project]
+name = "b4-research"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.3.5",
+    "pydantic>=2.12.5",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.0",
+    "ruff>=0.14.7",
+]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+ignore_missing_imports = true
+show_error_codes = true
