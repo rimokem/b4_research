@@ -19,8 +19,8 @@ class Config(NamedTuple):
     raw_file: str = "data/mine.csv"
 
     # 測定パラメータ
-    start_freq: float = 8.0  # GHz
-    stop_freq: float = 12.0
+    start_freq: float = 1.0  # GHz
+    stop_freq: float = 11.0
     freq_point: int = 1601
     scale_x: int = 30
     scale_y: int = 30
@@ -32,7 +32,7 @@ class Config(NamedTuple):
     num_classes: int = 8  # クラス数 (参照ベクトル数)
 
     # 特徴量抽出パラメータ
-    freq_count: int = 100  # サンプリングする周波数の数
+    freq_count: int = 10  # サンプリングする周波数の数
     window_size: int = 5  # 特徴抽出の窓サイズ (L)
 
 
@@ -178,7 +178,7 @@ def train_csom(features: NDArray[np.complex128], cfg: Config) -> Any:
                 weights[:, winner] = update_vecotor(weights[:, winner], k, alpha_t)
 
                 left = (winner - 1) % cfg.num_classes
-                right = (winner - 1) % cfg.num_classes
+                right = (winner + 1) % cfg.num_classes
 
                 weights[:, left] = update_vecotor(weights[:, left], k, beta_t)
                 weights[:, right] = update_vecotor(weights[:, right], k, beta_t)
