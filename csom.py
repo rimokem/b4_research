@@ -16,14 +16,14 @@ class Config(NamedTuple):
     """CSOMの設定パラメータ"""
 
     # 観測データのファイルパス
-    raw_file: str = "data/mine.csv"
+    raw_file: str = "data/mine3.csv"
 
     # 測定パラメータ
     start_freq: float = 1.0  # GHz
     stop_freq: float = 11.0
     freq_point: int = 1601
-    scale_x: int = 30
-    scale_y: int = 30
+    scale_x: int = 35
+    scale_y: int = 35
 
     # SOM 学習パラメータ
     alpha: float = 0.4  # 学習率 (勝者)
@@ -158,7 +158,7 @@ def train_csom(features: NDArray[np.complex128], cfg: Config) -> Any:
 
     # 可視化用セットアップ
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.axis("off")
+    # ax.axis("off")
     frames = []
 
     for t in range(cfg.epochs):
