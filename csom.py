@@ -16,14 +16,14 @@ class Config(NamedTuple):
     """CSOMの設定パラメータ"""
 
     # 観測データのファイルパス
-    raw_file: str = "data/mine.csv"
+    raw_file: str = "data/mine2.csv"
 
     # 測定パラメータ
     start_freq: float = 1.0  # GHz
     stop_freq: float = 11.0
     freq_point: int = 1601
-    scale_x: int = 30
-    scale_y: int = 30
+    scale_x: int = 35
+    scale_y: int = 35
 
     # SOM 学習パラメータ
     alpha: float = 0.4  # 学習率 (勝者)
@@ -134,10 +134,18 @@ def init_weights(dim: int, n_classes: int) -> NDArray[np.complex128]:
     return cast(NDArray[np.complex128], w_amp * np.exp(1j * w_phase))
 
 
+
 def find_winner(vec: NDArray[np.complex128], weights: NDArray[np.complex128]) -> int:
-    dots = vec.conj() @ weights
-    norms = np.linalg.norm(vec) * np.linalg.norm(weights, axis=0) + 1e-12
-    return int(np.argmax(np.abs(dots) / norms))
+    # 1. 差分ベクトルを計算 (ブロードキャストを使用)
+    # vecを (D,) から (D, 1) に変形して、(D, N) の weights から引く
+    diff = vec[:, np.newaxis] - weights
+    
+    # 2. 各列ベクトル（axis=0）ごとのノルム（距離）を計算
+    dists = np.linalg.norm(diff, axis=0)
+    print("Distances:", dists)
+    
+    # 3. 距離が「最小」のインデックスを返す
+    return int(np.argmin(dists))
 
 
 def update_vecotor(
