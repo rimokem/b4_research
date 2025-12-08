@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, NamedTuple, cast
+from typing import NamedTuple, Tuple, cast
 
 import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.animation as animation
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib import pyplot as plt
 from numpy.typing import NDArray
+
+matplotlib.use("Agg")
 
 
 class Config(NamedTuple):
@@ -28,12 +27,17 @@ class Config(NamedTuple):
     # SOM 学習パラメータ
     alpha: float = 0.4  # 学習率 (勝者)
     beta: float = 0.01  # 学習率 (近傍)
-    epochs: int = 100  # 学習ループ回数
+    epochs: int = 50  # 学習ループ回数
     num_classes: int = 8  # クラス数 (参照ベクトル数)
 
     # 特徴量抽出パラメータ
     freq_count: int = 10  # サンプリングする周波数の数
     window_size: int = 5  # 特徴抽出の窓サイズ (L)
+
+    # 能動的推論パラメータ
+    max_measurements: int = 50  # 最大測定回数
+    gpr_length_scale: float = 50.0  # GPRの長さスケール
+    gpr_noise_level: float = 0.01  # GPRのノイズレベル
 
 
 def load_file(
@@ -140,6 +144,42 @@ def find_winner(vec: NDArray[np.complex128], weights: NDArray[np.complex128]) ->
     return int(np.argmax(np.abs(dots) / norms))
 
 
+def calculate_distribution(
+    vec: NDArray[np.complex128],
+    weights: NDArray[np.complex128],
+    temperature: float = 0.1,
+) -> NDArray[np.float64]:
+    """
+    入力ベクトルと重み行列とのコサイン類似度に基づき、確率分布を計算して返します。
+
+    Args:
+        vec: 入力ベクトル (Complex)
+        weights: 重み行列 (Complex)
+        temperature: 分布の鋭さを調整するパラメータ (小さいほどTop1が強くなる)
+
+    Returns:
+        確率分布 (合計が1になる配列)
+    """
+    # 1. 内積 (Hermitian inner product)
+    dots = vec.conj() @ weights
+
+    # 2. ノルム計算
+    norms = np.linalg.norm(vec) * np.linalg.norm(weights, axis=0) + 1e-12
+
+    # 3. コサイン類似度 (絶対値をとって実数にする) [0.0 ~ 1.0]
+    cos_sims = np.abs(dots) / norms
+
+    # 4. 温度付きロジットの計算
+    logits = cos_sims / temperature
+
+    # 5. ソフトマックス関数 (数値安定化のため最大値を引く)
+    # exp(x) / sum(exp(x)) の計算
+    exp_logits = np.exp(logits - np.max(logits))
+    probs = exp_logits / np.sum(exp_logits)
+
+    return cast(NDArray[np.float64], probs)
+
+
 def update_vecotor(
     w: NDArray[np.complex128], k: NDArray[np.complex128], coef: float
 ) -> NDArray[np.complex128]:
@@ -152,21 +192,21 @@ def update_vecotor(
     return cast(NDArray[np.complex128], new_amp * np.exp(1j * new_angle))
 
 
-def train_csom(features: NDArray[np.complex128], cfg: Config) -> Any:
-    rows, cols, dim = features.shape
-    weights = init_weights(dim, cfg.num_classes)
-
-    # 可視化用セットアップ
-    fig, ax = plt.subplots(figsize=(6, 6))
-    # ax.axis("off")
-    frames = []
+def train_csom(
+    features: NDArray[np.complex128],
+    prev_weights: NDArray[np.complex128],
+    prev_class_map: NDArray[np.int_],
+    cfg: Config,
+) -> Tuple[NDArray[np.int_], NDArray[np.float64], NDArray[np.complex128]]:
+    rows, cols, _ = features.shape
+    weights = prev_weights.copy()
+    class_map = prev_class_map.copy()
+    distribution_map = np.zeros((rows, cols, cfg.num_classes), dtype=np.float64)
 
     for t in range(cfg.epochs):
         rate = (cfg.epochs - t) / cfg.epochs
         alpha_t = cfg.alpha * rate
         beta_t = cfg.beta * rate
-
-        class_map = np.zeros((rows, cols), dtype=int)
 
         for x in range(rows):
             for y in range(cols):
@@ -183,10 +223,12 @@ def train_csom(features: NDArray[np.complex128], cfg: Config) -> Any:
                 weights[:, left] = update_vecotor(weights[:, left], k, beta_t)
                 weights[:, right] = update_vecotor(weights[:, right], k, beta_t)
 
-        img = ax.imshow(class_map, cmap="Greys", vmin=0, vmax=cfg.num_classes - 1)
-        frames.append([img])
+    for x in range(rows):
+        for y in range(cols):
+            k = features[x, y]
+            distribution_map[x, y] = calculate_distribution(k, weights)
 
-    return fig, frames
+    return class_map, distribution_map, weights
 
 
 def main() -> None:
@@ -202,17 +244,21 @@ def main() -> None:
         cfg,
     )
 
-    fig, frames = train_csom(features, cfg)
+    rows, cols, dim = features.shape
+    initial_class_map = np.zeros((rows, cols), dtype=np.int_)
+    initial_weights = init_weights(dim, cfg.num_classes)
+
+    class_map, distribution_map, weights = train_csom(
+        features, initial_weights, initial_class_map, cfg
+    )
     # 結果保存
-    print("Saving video...")
-    ani = animation.ArtistAnimation(fig, frames, interval=100, blit=True)
-    try:
-        ani.save("CSOM_numpy.mp4", writer="ffmpeg")
-    except Exception as e:
-        print(f"Video save failed (ffmpeg required): {e}")
-        ani.save("CSOM_numpy.gif", writer="pillow")
+
+    print("Saving final image...")
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(class_map, cmap="Greys", vmin=0, vmax=cfg.num_classes - 1)
 
     plt.savefig("CSOM_numpy_final.png")
+    plt.close()  # メモリ解放のためClose
 
 
 if __name__ == "__main__":
