@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
 from typing import NamedTuple, Tuple, cast
 
 import matplotlib
@@ -42,7 +44,7 @@ class Config(NamedTuple):
 
 def load_file(
     cfg: Config,
-) -> NDArray[np.complex128]:
+) -> Tuple[NDArray[np.complex128], NDArray[np.float64]]:
     """
     ファイルから複素振幅データを読み込む関数
     """
@@ -62,7 +64,12 @@ def load_file(
     data = np.zeros((cfg.scale_x, cfg.scale_y, cfg.freq_point), dtype=np.complex128)
     data[df["x"], real_y, df["index_freq"]] = complex_values
 
-    return data
+    freq_mapping = (
+        df[["index_freq", "freq"]].drop_duplicates().sort_values("index_freq")
+    )
+    freqs = freq_mapping["freq"].values
+
+    return data, freqs
 
 
 def extract_features(
@@ -231,9 +238,84 @@ def train_csom(
     return class_map, distribution_map, weights
 
 
+def create_output_dir() -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outupt_dir = Path("results") / timestamp
+    outupt_dir.mkdir(parents=True, exist_ok=True)
+    return outupt_dir
+
+
+def save_class_map(
+    class_map: NDArray[np.int_],
+    cfg: Config,
+    output_dir: Path,
+    filename: str = "CSOM_map.png",
+) -> None:
+    filepath = output_dir / filename
+    print(f"Saving {filepath}...")
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # weights plotと同じ色マッピングを使用
+    colors = plt.cm.tab10(np.linspace(0, 1, cfg.num_classes))
+    cmap = matplotlib.colors.ListedColormap(colors)
+
+    ax.imshow(class_map, cmap=cmap, vmin=0, vmax=cfg.num_classes - 1)
+    plt.savefig(filepath)
+    plt.close()
+
+
+def save_weights_plot(
+    weights: NDArray[np.complex128],
+    cfg: Config,
+    output_dir: Path,
+    filename: str = "CSOM_weights.png",
+) -> None:
+    filepath = output_dir / filename
+    print(f"Saving {filepath}...")
+    feature_dim = weights.shape[0]
+    fig, axes = plt.subplots(
+        2,
+        (feature_dim + 1) // 2,
+        figsize=(15, 8),
+        subplot_kw={"projection": "polar"},
+    )
+    axes = axes.flatten()
+
+    colors = plt.cm.tab10(np.linspace(0, 1, cfg.num_classes))
+
+    for dim_idx in range(feature_dim):
+        ax = axes[dim_idx]
+
+        weights_dim = weights[dim_idx, :]
+        magnitudes = np.abs(weights_dim)
+        phases = np.angle(weights_dim)
+
+        for class_idx in range(cfg.num_classes):
+            ax.plot(
+                [0, phases[class_idx]],
+                [0, magnitudes[class_idx]],
+                c=colors[class_idx],
+                linewidth=2,
+                marker="o",
+                markersize=8,
+                label=f"Class {class_idx}",
+            )
+
+        ax.set_title(f"Dimension {dim_idx}", pad=20)
+        ax.grid(True, alpha=0.3)
+
+    # 余った軸を非表示
+    for idx in range(feature_dim, len(axes)):
+        axes[idx].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(filepath, dpi=150)
+    plt.close()
+
+
 def main() -> None:
     cfg = Config()
-    data = load_file(Config())
+    data, freqs = load_file(Config())
 
     # 10個の周波数成分を用いて特徴量抽出
     selected_freqs = np.linspace(0, cfg.freq_point - 1, cfg.freq_count, dtype=int)
@@ -253,12 +335,9 @@ def main() -> None:
     )
     # 結果保存
 
-    print("Saving final image...")
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.imshow(class_map, cmap="Greys", vmin=0, vmax=cfg.num_classes - 1)
-
-    plt.savefig("CSOM_numpy_final.png")
-    plt.close()  # メモリ解放のためClose
+    output_dir = create_output_dir()
+    save_class_map(class_map, cfg, output_dir)
+    save_weights_plot(weights, cfg, output_dir)
 
 
 if __name__ == "__main__":
