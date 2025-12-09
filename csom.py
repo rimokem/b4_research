@@ -42,6 +42,11 @@ class Config(NamedTuple):
     gpr_noise_level: float = 0.01  # GPRのノイズレベル
 
 
+# ============================================================
+# データ読み込みと前処理
+# ============================================================
+
+
 def load_file(
     cfg: Config,
 ) -> Tuple[NDArray[np.complex128], NDArray[np.float64]]:
@@ -70,6 +75,11 @@ def load_file(
     freqs = freq_mapping["freq"].values
 
     return data, freqs
+
+
+# ============================================================
+# 特徴量抽出
+# ============================================================
 
 
 def extract_features(
@@ -136,6 +146,11 @@ def calc_spatial_corr(
 
     n_freq = cfg.freq_count
     return cast(np.complex128, np.sum(b1 * b2.conj()) / (lx * ly * n_freq))
+
+
+# ============================================================
+# CSOM: 重みの初期化・学習・推論
+# ============================================================
 
 
 def init_weights(dim: int, n_classes: int) -> NDArray[np.complex128]:
@@ -238,6 +253,158 @@ def train_csom(
     return class_map, distribution_map, weights
 
 
+def calculate_weights_variance(
+    weights: NDArray[np.complex128],
+) -> float:
+    """
+    重み行列のベクトル間距離に基づく分散を計算する関数
+    距離は (w_i - w_j) とその複素共役の内積で定義
+
+    Args:
+        weights: 重み行列 (dim, num_classes)
+
+    Returns:
+        全次元における距離の平均分散
+    """
+    dim, num_classes = weights.shape
+    all_distances = []
+
+    for d in range(dim):
+        # 各次元のクラスベクトルを取得
+        w_d = weights[d, :]  # (num_classes,)
+
+        # 全ペアの距離を計算
+        for i in range(num_classes):
+            for j in range(i + 1, num_classes):
+                diff = w_d[i] - w_d[j]
+                # 距離 = (w_i - w_j) · (w_i - w_j)* = |w_i - w_j|²
+                distance = np.real(diff * diff.conj())
+                all_distances.append(distance)
+
+    return float(np.var(all_distances))
+
+
+# ============================================================
+# Active Inference: 状態推定・行動選択・学習
+# ============================================================
+
+
+def infer_state(obs_idx, A, B_counts, prev_qs, last_action_idx):
+    """
+    観測から現在の状態確率(qs)を計算する (Perception)
+    """
+    # 尤度: P(o|s)
+    likelihood = A[obs_idx, :].reshape(-1, 1)
+
+    # 事前分布: P(s_t | s_t-1, u)
+    if prev_qs is not None and last_action_idx is not None:
+        # 選んだ行動に対応するB行列(正規化済み)を取得
+        B_action = normalize_counts(B_counts[last_action_idx])
+        prior = np.dot(B_action, prev_qs)
+    else:
+        # 最初は分からないので一様分布
+        prior = np.ones((A.shape[1], 1)) / A.shape[1]
+
+    # ベイズ更新: Posterior ∝ Likelihood * Prior
+    log_qs = np.log(likelihood + 1e-16) + np.log(prior + 1e-16)
+    qs = softmax(log_qs)
+    return qs
+
+
+def softmax(x):
+    e_x = np.exp(x - np.max(x))  # オーバーフロー対策
+    return e_x / e_x.sum(axis=0)
+
+
+def calculate_efe(A, B, C, current_state_belief) -> float:
+    """
+    期待自由エネルギー (EFE) を計算する関数
+    """
+    predcted_state = np.dot(B, current_state_belief)
+    predecited_obs = np.dot(A, predcted_state)
+
+    eps = 1e-16
+    H_A = -np.sum(A * np.log(A + eps), axis=0)
+
+    ambiguity = np.dot(H_A, predcted_state)
+
+    risk = np.sum(predecited_obs * (np.log(predecited_obs + eps) - np.log(C + eps)))
+
+    G = risk + ambiguity
+    print(f"G: {G[0]:.4f}")
+
+    return G[0]
+
+
+def update_parameters(
+    a_counts, b_counts, obs_idx, current_qs, prev_qs, policy_idx, lr=1.0
+):
+    """
+    パラメータ（経験値カウント）を更新する関数
+
+    a_counts: A行列のカウント (No, Ns)
+    b_counts: B行列のカウント (..., Ns, Ns)
+    obs_idx: 観測されたデータのインデックス (int)
+    current_qs: 現在の状態推定 (Ns, 1)
+    prev_qs: 1つ前の状態推定 (Ns, 1) or None
+    policy_idx: 実行したポリシーのインデックス (tuple)
+    lr: 学習率 (1回あたりの重み)
+    """
+
+    # --- 1. A行列（尤度）の更新 ---
+    # 観測(o) と 現在の状態(s) の結びつきを強化
+
+    # 観測をOne-hotベクトル化
+    num_obs = a_counts.shape[0]
+    o_onehot = np.zeros((num_obs, 1))
+    o_onehot[obs_idx] = 1.0
+
+    # 外積 (No x 1) * (1 x Ns) = (No, Ns) を計算して加算
+    da = lr * np.dot(o_onehot, current_qs.T)
+    a_counts += da
+
+    # --- 2. B行列（遷移）の更新 ---
+    # 前の状態(s_tm1) -> 今の状態(s_t) の遷移を強化
+    # 初回ステップ(prev_qsがない場合)は更新できないためスキップ
+
+    if prev_qs is not None:
+        # 外積 (Ns x 1) * (1 x Ns) = (Ns, Ns)
+        # 行:現在の状態(Next), 列:前の状態(Prev)
+        db = lr * np.dot(current_qs, prev_qs.T)
+
+        # policy_idx (タプル) を使って、該当する行動のシートだけを更新
+        b_counts[policy_idx] += db
+
+    return a_counts, b_counts
+
+
+def normalize_counts(counts):
+    """
+    カウント行列を確率行列（合計1.0）に変換するヘルパー関数
+    """
+    # 列方向(axis=-2)の合計で割る
+    # A行列 (No, Ns) -> 各列(状態)ごとに正規化
+    # B行列 (..., Ns, Ns) -> 各列(前の状態)ごとに正規化
+
+    # ゼロ除算回避のための小さな値
+    eps = 1e-16
+
+    # sumのaxisは、最後の2次元のうち「列」方向なので -2
+    # (行列の形状定義によりますが、通常 Active Inferenceでは column-stochastic です)
+    # A: sum(axis=0), B: sum(axis=-2) ですが、
+    # ここでは汎用的に書くため手動で指定します。
+
+    if counts.ndim == 2:  # A行列の場合
+        return counts / (counts.sum(axis=0, keepdims=True) + eps)
+    else:  # B行列の場合
+        return counts / (counts.sum(axis=-2, keepdims=True) + eps)
+
+
+# ============================================================
+# 可視化・保存
+# ============================================================
+
+
 def create_output_dir() -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outupt_dir = Path("results") / timestamp
@@ -313,7 +480,171 @@ def save_weights_plot(
     plt.close()
 
 
-def main() -> None:
+def save_variance_plot(
+    weights: NDArray[np.complex128],
+    cfg: Config,
+    output_dir: Path,
+    filename: str = "CSOM_variance.png",
+) -> None:
+    """
+    重みベクトル間の距離統計をプロットして保存する関数
+    """
+    filepath = output_dir / filename
+    print(f"Saving {filepath}...")
+
+    # 各次元ごとの統計を計算
+    dim, num_classes = weights.shape
+    mean_distances = np.zeros(dim, dtype=np.float64)
+    variance_distances = np.zeros(dim, dtype=np.float64)
+
+    for d in range(dim):
+        w_d = weights[d, :]
+        distances = []
+        for i in range(num_classes):
+            for j in range(i + 1, num_classes):
+                diff = w_d[i] - w_d[j]
+                distance = np.real(diff * diff.conj())
+                distances.append(distance)
+
+        distances_array = np.array(distances)
+        mean_distances[d] = np.mean(distances_array)
+        variance_distances[d] = np.var(distances_array)
+
+    # 全体の分散
+    overall_variance = calculate_weights_variance(weights)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+    # 平均距離
+    ax1.bar(range(dim), mean_distances)
+    ax1.set_xlabel("Feature Dimension")
+    ax1.set_ylabel("Mean Distance")
+    ax1.set_title("Mean Distance Between Weight Vectors")
+    ax1.grid(True, alpha=0.3)
+
+    # 距離の分散
+    ax2.bar(range(dim), variance_distances)
+    ax2.set_xlabel("Feature Dimension")
+    ax2.set_ylabel("Variance of Distances")
+    ax2.set_title("Variance of Distances Between Weight Vectors")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(filepath, dpi=150)
+    plt.close()
+
+    # 統計情報を表示
+    print(f"Overall variance: {overall_variance:.4f}")
+    print(
+        f"Mean distance - Mean: {mean_distances.mean():.4f}, Std: {mean_distances.std():.4f}"
+    )
+    print(
+        f"Variance of distances - Mean: {variance_distances.mean():.4f}, Std: {variance_distances.std():.4f}"
+    )
+
+
+# ============================================================
+# メイン実行関数
+# ============================================================
+
+
+def active_inference():
+    C = np.array([0.4, 0.3, 0.2, 0.1, 0.0]).reshape(5, 1)
+    qs = np.array([0.5, 0.5]).reshape(2, 1)
+
+    a = np.array([[0.4, 0.0], [0.3, 0.1], [0.2, 0.2], [0.1, 0.3], [0.0, 0.4]])
+    state_dims = [3] * 10
+    b = np.zeros(state_dims + [2, 2], dtype=np.float64)
+    for idx in np.ndindex(*state_dims):
+        b[idx] = np.array([[0.5, 0.5], [0.5, 0.5]])
+
+    prev_qs = None
+    last_action = None
+
+    cfg = Config()
+    data, freqs = load_file(Config())
+
+    # 10個の周波数成分を用いて特徴量抽出
+    selected_freqs = np.linspace(0, cfg.freq_point - 1, cfg.freq_count, dtype=int)
+    print(freqs[selected_freqs])
+
+    print("-" * 60)
+    print("Start Simulation Loop")
+    print("-" * 60)
+
+    for t in range(100):
+        print(f"--- Step {t + 1} ---")
+
+        if last_action is not None:
+            for i, item in enumerate(last_action):
+                selected_freqs[i] = min(
+                    max(0, selected_freqs[i] + (item - 1) * 100), cfg.freq_point - 1
+                )
+        # 選択された周波数を表示
+        print("Selected frequencies (GHz): ", freqs[selected_freqs])
+
+        features = extract_features(
+            data[:, :, selected_freqs],
+            cfg,
+        )
+
+        rows, cols, dim = features.shape
+        initial_class_map = np.zeros((rows, cols), dtype=np.int_)
+        initial_weights = init_weights(dim, cfg.num_classes)
+
+        class_map, distribution_map, weights = train_csom(
+            features, initial_weights, initial_class_map, cfg
+        )
+
+        obs = calculate_weights_variance(weights)
+        obs_idx = 0
+        if obs > 3.36:
+            obs_idx = 0
+        elif obs > 3.13:
+            obs_idx = 1
+        elif obs > 2.93:
+            obs_idx = 2
+        elif obs > 2.73:
+            obs_idx = 3
+        else:
+            obs_idx = 4
+
+        A = normalize_counts(a)
+
+        prev_qs_backup = qs.copy()
+        qs = infer_state(obs_idx, A, b, prev_qs, last_action)
+
+        a, b = update_parameters(a, b, obs_idx, qs, prev_qs, last_action, lr=1.0)
+
+        prev_qs = qs.copy()
+
+        best_efe = float("inf")
+        best_action = None
+
+        A = normalize_counts(a)
+
+        for action_idx in np.ndindex(*state_dims):
+            B = normalize_counts(b[action_idx])
+
+            G = calculate_efe(A, B, C, qs)
+
+            if G < best_efe:
+                best_efe = G
+                best_action = action_idx
+
+        print(
+            f"Time {t}: Obs={obs_idx} | Belief(s0)={qs[0, 0]:.2f} | Action={best_action} | EFE={best_efe:.2f}"
+        )
+
+        last_action = best_action
+
+        # 結果保存
+        output_dir = create_output_dir()
+        save_class_map(class_map, cfg, output_dir, filename=f"step{t + 1}_map.png")
+        save_weights_plot(weights, cfg, output_dir, filename=f"step{t + 1}_weights.png")
+
+
+def csom() -> None:
     cfg = Config()
     data, freqs = load_file(Config())
 
@@ -338,6 +669,12 @@ def main() -> None:
     output_dir = create_output_dir()
     save_class_map(class_map, cfg, output_dir)
     save_weights_plot(weights, cfg, output_dir)
+    save_variance_plot(weights, cfg, output_dir)  # 追加
+
+
+def main() -> None:
+    active_inference()
+    # csom()
 
 
 if __name__ == "__main__":
