@@ -37,9 +37,6 @@ class Config(NamedTuple):
     window_size: int = 5  # 特徴抽出の窓サイズ (L)
 
     # 能動的推論パラメータ
-    max_measurements: int = 50  # 最大測定回数
-    gpr_length_scale: float = 50.0  # GPRの長さスケール
-    gpr_noise_level: float = 0.01  # GPRのノイズレベル
 
 
 # ============================================================
@@ -72,7 +69,7 @@ def load_file(
     freq_mapping = (
         df[["index_freq", "freq"]].drop_duplicates().sort_values("index_freq")
     )
-    freqs = freq_mapping["freq"].values
+    freqs = freq_mapping["freq"].values / (10**9)
 
     return data, freqs
 
@@ -144,7 +141,6 @@ def calc_spatial_corr(
 
     n_freq = cfg.freq_count
     temp = np.sum(b1 * b2.conj() / (lx * ly * n_freq))
-    print(f"real: {temp.real}, imag: {temp.imag}")
     return cast(np.complex128, np.sum(b1 * b2.conj()) / (lx * ly * n_freq))
 
 
@@ -225,14 +221,6 @@ def train_csom(
     class_map = prev_class_map.copy()
     distribution_map = np.zeros((rows, cols, cfg.num_classes), dtype=np.float64)
 
-    output_dir = create_output_dir()
-    save_weights_plot(
-        weights,
-        cfg,
-        output_dir,
-        filename="epoch_0_weights.png",
-    )
-
     for t in range(cfg.epochs):
         rate = (cfg.epochs - t) / cfg.epochs
         alpha_t = cfg.alpha * rate
@@ -252,20 +240,6 @@ def train_csom(
 
                 weights[:, left] = update_vecotor(weights[:, left], k, beta_t)
                 weights[:, right] = update_vecotor(weights[:, right], k, beta_t)
-
-        save_weights_plot(
-            weights,
-            cfg,
-            output_dir,
-            filename=f"epoch_{t + 1}_weights.png",
-        )
-
-        save_class_map(
-            class_map,
-            cfg,
-            output_dir,
-            filename=f"epoch_{t + 1}_map.png",
-        )
 
     for x in range(rows):
         for y in range(cols):
@@ -353,7 +327,6 @@ def calculate_efe(A, B, C, current_state_belief) -> float:
     risk = np.sum(predecited_obs * (np.log(predecited_obs + eps) - np.log(C + eps)))
 
     G = risk + ambiguity
-    print(f"G: {G[0]:.4f}")
 
     return G[0]
 
@@ -439,6 +412,7 @@ def save_class_map(
     cfg: Config,
     output_dir: Path,
     filename: str = "CSOM_map.png",
+    selected_freqs: NDArray[np.float64] | None = None,
 ) -> None:
     filepath = output_dir / filename
     print(f"Saving {filepath}...")
@@ -449,6 +423,11 @@ def save_class_map(
     cmap = matplotlib.colors.ListedColormap(colors)
 
     ax.imshow(class_map, cmap=cmap, vmin=0, vmax=cfg.num_classes - 1)
+
+    if selected_freqs is not None:
+        freq_str = ", ".join([f"{f:.2f}" for f in selected_freqs])
+        ax.set_title(f"Selected Freqs: {freq_str} [GHz]", fontsize=8)
+
     plt.savefig(filepath)
     plt.close()
 
@@ -458,6 +437,7 @@ def save_weights_plot(
     cfg: Config,
     output_dir: Path,
     filename: str = "CSOM_weights.png",
+    selected_freqs: NDArray[np.float64] | None = None,
 ) -> None:
     filepath = output_dir / filename
     print(f"Saving {filepath}...")
@@ -469,6 +449,10 @@ def save_weights_plot(
         subplot_kw={"projection": "polar"},
     )
     axes = axes.flatten()
+
+    if selected_freqs is not None:
+        freq_str = ", ".join([f"{f:.2f}" for f in selected_freqs])
+        plt.suptitle(f"Selected Freqs: {freq_str} [GHz]", fontsize=10)
 
     colors = plt.cm.tab10(np.linspace(0, 1, cfg.num_classes))
 
@@ -578,7 +562,8 @@ def active_inference():
     state_dims = [3] * 10
     b = np.zeros(state_dims + [2, 2], dtype=np.float64)
     for idx in np.ndindex(*state_dims):
-        b[idx] = np.array([[0.5, 0.5], [0.5, 0.5]])
+        # bをランダムで初期化
+        b[idx] = np.random.rand(2, 2)
 
     prev_qs = None
     last_action = None
@@ -590,11 +575,15 @@ def active_inference():
     selected_freqs = np.linspace(0, cfg.freq_point - 1, cfg.freq_count, dtype=int)
     print(freqs[selected_freqs])
 
+    output_dir = create_output_dir()
+
+    lr = 1.0
+
     print("-" * 60)
     print("Start Simulation Loop")
     print("-" * 60)
 
-    for t in range(100):
+    for t in range(30):
         print(f"--- Step {t + 1} ---")
 
         if last_action is not None:
@@ -602,6 +591,8 @@ def active_inference():
                 selected_freqs[i] = min(
                     max(0, selected_freqs[i] + (item - 1) * 100), cfg.freq_point - 1
                 )
+            selected_freqs.sort()
+
         # 選択された周波数を表示
         print("Selected frequencies (GHz): ", freqs[selected_freqs])
 
@@ -633,10 +624,11 @@ def active_inference():
 
         A = normalize_counts(a)
 
-        prev_qs_backup = qs.copy()
         qs = infer_state(obs_idx, A, b, prev_qs, last_action)
 
-        a, b = update_parameters(a, b, obs_idx, qs, prev_qs, last_action, lr=1.0)
+        a, b = update_parameters(
+            a, b, obs_idx, qs, prev_qs, last_action, lr=(lr - (t / 30))
+        )
 
         prev_qs = qs.copy()
 
@@ -661,9 +653,20 @@ def active_inference():
         last_action = best_action
 
         # 結果保存
-        output_dir = create_output_dir()
-        save_class_map(class_map, cfg, output_dir, filename=f"step{t + 1}_map.png")
-        save_weights_plot(weights, cfg, output_dir, filename=f"step{t + 1}_weights.png")
+        save_class_map(
+            class_map,
+            cfg,
+            output_dir,
+            filename=f"step{t + 1}_map.png",
+            selected_freqs=freqs[selected_freqs],
+        )
+        save_weights_plot(
+            weights,
+            cfg,
+            output_dir,
+            filename=f"step{t + 1}_weights.png",
+            selected_freqs=freqs[selected_freqs],
+        )
 
 
 def csom() -> None:
@@ -689,14 +692,13 @@ def csom() -> None:
     # 結果保存
 
     output_dir = create_output_dir()
-    save_class_map(class_map, cfg, output_dir)
-    save_weights_plot(weights, cfg, output_dir)
+    save_class_map(class_map, cfg, output_dir, selected_freqs=freqs[selected_freqs])
+    save_weights_plot(weights, cfg, output_dir, selected_freqs=freqs[selected_freqs])
     save_variance_plot(weights, cfg, output_dir)  # 追加
 
 
 def main() -> None:
-    # active_inference()
-    csom()
+    active_inference()
 
 
 if __name__ == "__main__":
