@@ -29,7 +29,7 @@ class Config(NamedTuple):
     # SOM 学習パラメータ
     alpha: float = 0.4  # 学習率 (勝者)
     beta: float = 0.01  # 学習率 (近傍)
-    epochs: int = 50  # 学習ループ回数
+    epochs: int = 30  # 学習ループ回数
     num_classes: int = 8  # クラス数 (参照ベクトル数)
 
     # 特徴量抽出パラメータ
@@ -97,14 +97,12 @@ def extract_features(
         (out_rows, out_cols, (cfg.freq_count - 1) + 5), dtype=np.complex128
     )
 
-    norm_const = L * L * cfg.freq_count
-
     for x in range(out_rows):
         for y in range(out_cols):
             block = data[x : x + L, y : y + L, :]
 
             # 1. 平均値
-            features[x, y, 0] = np.sum(block) / norm_const
+            features[x, y, 0] = np.sum(block) / (L * L * cfg.freq_count)
 
             # 2-5. 空間相関(0,0), (1,0), (0,1), (1,1)
             features[x, y, 1] = calc_spatial_corr(data, x, y, 0, 0, cfg)
@@ -117,7 +115,7 @@ def extract_features(
                 d1 = data[x : x + L, y : y + L, i]
                 d2 = data[x : x + L, y : y + L, i + 1]
 
-                features[x, y, 5 + i] = np.sum(d1 * d2.conj()) / L * L
+                features[x, y, 5 + i] = np.sum(d1 * d2.conj()) / (L * L)
 
     return features
 
@@ -145,6 +143,8 @@ def calc_spatial_corr(
     b2 = data[tx : tx + lx, ty : ty + ly, :]
 
     n_freq = cfg.freq_count
+    temp = np.sum(b1 * b2.conj() / (lx * ly * n_freq))
+    print(f"real: {temp.real}, imag: {temp.imag}")
     return cast(np.complex128, np.sum(b1 * b2.conj()) / (lx * ly * n_freq))
 
 
@@ -225,6 +225,14 @@ def train_csom(
     class_map = prev_class_map.copy()
     distribution_map = np.zeros((rows, cols, cfg.num_classes), dtype=np.float64)
 
+    output_dir = create_output_dir()
+    save_weights_plot(
+        weights,
+        cfg,
+        output_dir,
+        filename="epoch_0_weights.png",
+    )
+
     for t in range(cfg.epochs):
         rate = (cfg.epochs - t) / cfg.epochs
         alpha_t = cfg.alpha * rate
@@ -244,6 +252,20 @@ def train_csom(
 
                 weights[:, left] = update_vecotor(weights[:, left], k, beta_t)
                 weights[:, right] = update_vecotor(weights[:, right], k, beta_t)
+
+        save_weights_plot(
+            weights,
+            cfg,
+            output_dir,
+            filename=f"epoch_{t + 1}_weights.png",
+        )
+
+        save_class_map(
+            class_map,
+            cfg,
+            output_dir,
+            filename=f"epoch_{t + 1}_map.png",
+        )
 
     for x in range(rows):
         for y in range(cols):
@@ -673,8 +695,8 @@ def csom() -> None:
 
 
 def main() -> None:
-    active_inference()
-    # csom()
+    # active_inference()
+    csom()
 
 
 if __name__ == "__main__":
